@@ -3,7 +3,9 @@
 
 
 # Featuring:
-Remembers window layouts in Hyprland. By default, Hyprland applies a single keyboard layout globally across all windows. However, if you use more than one language, this becomes a hassle. While hyprland-per-window-layout exists, but in my case it sometimes picked a wrong layout, and somtimes buggy. This tiny daemon should solve the problem completely! With it, managing layouts feels just like in KDE, Windows, or any other sane OS. Uses about 130 KB of private memory (≈2.2 MB RSS including shared libraries). Simple, reliable and efficient.
+
+
+Remembers window layouts in Hyprland. By default, Hyprland applies a single keyboard layout globally across all windows. However, if you use more than one language, this becomes a hassle. While hyprland-per-window-layout exists, in my case it sometimes picked the wrong layout. This tiny daemon should solve the problem completely! With it, managing layouts feels just like in KDE, Windows, or any other sane OS. Uses about 130 KB of private memory (≈2.2 MB RSS including shared libraries). Simple, reliable and efficient.
 
 ## How it works
 
