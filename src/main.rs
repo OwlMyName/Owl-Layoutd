@@ -1,49 +1,91 @@
-// per-window-layout: раскладка клавиатуры на каждое окно для Hyprland (как в KDE).
-// Только стандартная библиотека, ни одной зависимости.
+// Owl-Layoutd: per-application (window class) keyboard layout for Hyprland.
+// Like KDE's "Application" switching policy. Standard library only, zero dependencies.
+//
+// Debug:             OWL_DEBUG=1 Owl-Layoutd
+// Custom keyboard:   OWL_KEYBOARD=name Owl-Layoutd  (names: `hyprctl devices`)
 
 use std::env;
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
-/// Стартовая раскладка НОВОГО окна по его классу: 0=us 1=ru 2=ua 3=cz.
-/// Если класса тут нет, окно стартует с 0.
-const RULES: &[(&str, u8)] = &[
-    ("wezterm-test7", 0),
-    ("com.visualstudio.CodeOSS", 0),
-    ("com.ayugram.desktop", 1),
-];
+/// Keyboard whose layout we track
+const KEYBOARD: &str = "at-translated-set-2-keyboard";
+
+/// Layout when no window is focused (Rofi, panels): 0 = first in the list (us)
+const NO_WINDOW_LAYOUT: u8 = 0;
 
 struct State {
     cmd_path: String,
-    wins: Vec<(u64, u8)>, // (адрес окна, его раскладка)
-    cur: Option<u64>,     // окно в фокусе
-    curidx: Option<u8>,   // текущая раскладка основной клавиатуры
-    pending: u32,         // сколько эхо-событий от собственных переключений ждём
-    mainkb: Vec<u8>,      // имя основной клавиатуры
-    buf: Vec<u8>,         // переиспользуемый буфер под ответы Хайпра
+    keyboard: String,
+    debug: bool,
+    classes: Vec<(Vec<u8>, u8)>, // window class -> remembered layout
+    cur: Option<usize>,          // currently focused class
+    curidx: Option<u8>,          // current keyboard layout
+    store: Option<PathBuf>,      // file where state is persisted
+    buf: Vec<u8>,                // buffer for Hyprland replies
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn rfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).rposition(|w| w == needle)
-}
-
-/// "55a8d2b3c4e0" -> число (адрес окна)
-fn hex(s: &[u8]) -> Option<u64> {
-    let s = s.strip_prefix(b"0x").unwrap_or(s);
-    if s.is_empty() || s.len() > 16 {
-        return None;
-    }
-    s.iter()
-        .try_fold(0u64, |acc, &b| Some((acc << 4) | (b as char).to_digit(16)? as u64))
+/// Where to store state: ~/.local/state/owl-layoutd/classes
+fn store_path() -> Option<PathBuf> {
+    let base = match env::var_os("XDG_STATE_HOME") {
+        Some(s) if !s.is_empty() => PathBuf::from(s),
+        _ => PathBuf::from(env::var_os("HOME")?).join(".local/state"),
+    };
+    let dir = base.join("owl-layoutd");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("classes"))
 }
 
 impl State {
-    /// Отправить команду в .socket.sock (как это делает hyprctl); ответ попадает в self.buf
+    /// Load state from file: lines like "1 com.ayugram.desktop"
+    fn load(&mut self) {
+        let Some(path) = &self.store else { return };
+        let Ok(data) = fs::read(path) else { return };
+        for line in data.split(|&b| b == b'\n') {
+            let Some(sp) = line.iter().position(|&b| b == b' ') else { continue };
+            let Some(idx) = std::str::from_utf8(&line[..sp])
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            self.classes.push((line[sp + 1..].to_vec(), idx));
+        }
+    }
+
+    /// Save state to file (via a temp file to avoid corruption on crash)
+    fn save(&self) {
+        let Some(path) = &self.store else { return };
+        let mut out = Vec::new();
+        for (class, idx) in &self.classes {
+            out.extend_from_slice(idx.to_string().as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(class);
+            out.push(b'\n');
+        }
+        let tmp = path.with_extension("tmp");
+        if fs::write(&tmp, &out).is_ok() {
+            let _ = fs::rename(&tmp, path);
+        }
+    }
+
+    /// Class index in the table (new class gets layout 0)
+    fn class_id(&mut self, class: &[u8]) -> usize {
+        if let Some(i) = self.classes.iter().position(|c| c.0 == class) {
+            return i;
+        }
+        self.classes.push((class.to_vec(), 0));
+        self.classes.len() - 1
+    }
+
+    /// Send command to .socket.sock (like hyprctl); reply goes into self.buf
     fn cmd(&mut self, c: &[u8]) -> Option<()> {
         let mut s = UnixStream::connect(&self.cmd_path).ok()?;
         s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
@@ -53,99 +95,104 @@ impl State {
         Some(())
     }
 
-    /// Узнать текущую раскладку основной клавиатуры (и заодно её имя)
+    /// Current layout of our specific keyboard
     fn query_idx(&mut self) -> Option<u8> {
         self.cmd(b"j/devices")?;
         let b = &self.buf;
-        let m = find(b, b"\"main\": true")?;
+        let needle = format!("\"name\": \"{}\"", self.keyboard);
+        let at = find(b, needle.as_bytes())?;
+        // search for the index only within this keyboard's block (up to the next "name")
+        let limit = find(&b[at + 1..], b"\"name\": \"").map_or(b.len(), |p| at + 1 + p);
         let key: &[u8] = b"\"active_layout_index\": ";
-        let k = rfind(&b[..m], key)?;
+        let k = at + find(&b[at..limit], key)?;
         let digits = &b[k + key.len()..];
         let n = digits.iter().take_while(|c| c.is_ascii_digit()).count();
-        let idx: u8 = std::str::from_utf8(&digits[..n]).ok()?.parse().ok()?;
-
-        let nkey: &[u8] = b"\"name\": \"";
-        let nk = rfind(&b[..k], nkey)?;
-        let rest = &b[nk + nkey.len()..k];
-        let end = rest.iter().position(|&c| c == b'"')?;
-        self.mainkb.clear();
-        self.mainkb.extend_from_slice(&rest[..end]);
-        Some(idx)
+        std::str::from_utf8(&digits[..n]).ok()?.parse().ok()
     }
 
-    /// Переключить все клавиатуры на раскладку idx (если она уже такая, ничего не делаем)
+    /// Switch ALL keyboards to layout idx
+    fn switch_all(&mut self, idx: u8) -> bool {
+        let c = format!("/switchxkblayout all {idx}");
+        let sent = self.cmd(c.as_bytes()).is_some();
+        let ok = sent && self.buf.starts_with(b"ok");
+        if self.debug {
+            eprintln!("switch all {idx}: sent={sent} reply={:?}", String::from_utf8_lossy(&self.buf));
+        }
+        ok
+    }
+
     fn apply(&mut self, idx: u8) {
         if self.curidx == Some(idx) {
             return;
         }
-        let c = format!("/switchxkblayout all {idx}");
-        if self.cmd(c.as_bytes()).is_some() && self.buf.starts_with(b"ok") {
+        if self.switch_all(idx) {
             self.curidx = Some(idx);
-            self.pending += 1; // ждём эхо от самих себя
         }
+    }
+
+    /// Check which window is focused when the daemon starts
+    fn init_focus(&mut self) {
+        if self.cmd(b"j/activewindow").is_none() {
+            return;
+        }
+        let key: &[u8] = b"\"class\": \"";
+        let Some(p) = find(&self.buf, key) else { return };
+        let rest = &self.buf[p + key.len()..];
+        let Some(e) = rest.iter().position(|&c| c == b'"') else { return };
+        let class = rest[..e].to_vec();
+        if class.is_empty() {
+            return;
+        }
+        let id = self.class_id(&class);
+        self.cur = Some(id);
+        let idx = self.classes[id].1;
+        self.apply(idx);
     }
 
     fn handle(&mut self, line: &[u8]) {
         let Some(p) = find(line, b">>") else { return };
         let (name, data) = (&line[..p], &line[p + 2..]);
         match name {
-            // сменился фокус: вспоминаем раскладку нового окна
-            b"activewindowv2" => {
-                self.cur = hex(data);
-                if let Some(a) = self.cur {
-                    let idx = match self.wins.iter().find(|w| w.0 == a) {
-                        Some(w) => w.1,
-                        None => {
-                            self.wins.push((a, 0));
-                            0
-                        }
-                    };
+            // focus changed: data has the format "class,title"
+            b"activewindow" => {
+                let class = data.split(|&b| b == b',').next().unwrap_or(&[]);
+                if class.is_empty() {
+                    self.cur = None;
+                    if self.debug {
+                        eprintln!("focus: no window, data={:?}", String::from_utf8_lossy(data));
+                    }
+                    self.apply(NO_WINDOW_LAYOUT);
+                } else {
+                    let id = self.class_id(class);
+                    self.cur = Some(id);
+                    let idx = self.classes[id].1;
+                    if self.debug {
+                        eprintln!("focus: class {:?} wants {idx}, now {:?}",
+                            String::from_utf8_lossy(class), self.curidx);
+                    }
                     self.apply(idx);
                 }
             }
-            // сменилась раскладка: запоминаем её для окна в фокусе
+            // layout changed: remember it for the focused class
             b"activelayout" => {
                 let kb = data.split(|&b| b == b',').next().unwrap_or(&[]);
-                if !self.mainkb.is_empty() && kb != &self.mainkb[..] {
-                    return; // чужие "клавиатуры" (кнопки, наушники, ydotool) игнорируем
+                if kb != self.keyboard.as_bytes() {
+                    return; // ignore other devices
                 }
-                if self.pending > 0 {
-                    self.pending -= 1; // это эхо нашего же переключения
-                    return;
+                let Some(q) = self.query_idx() else { return };
+                if self.debug {
+                    eprintln!("layout event: now {q}, known {:?}, class {:?}", self.curidx,
+                        self.cur.map(|i| String::from_utf8_lossy(&self.classes[i].0).into_owned()));
                 }
-                if let Some(q) = self.query_idx() {
+                if self.curidx != Some(q) {
+                    // user switched manually: sync the remaining devices
                     self.curidx = Some(q);
-                    if let Some(a) = self.cur {
-                        if let Some(w) = self.wins.iter_mut().find(|w| w.0 == a) {
-                            w.1 = q;
-                        }
-                    }
+                    self.switch_all(q);
                 }
-            }
-            // новое окно: формат "адрес,воркспейс,класс,заголовок"
-            b"openwindow" => {
-                let mut it = data.splitn(4, |&b| b == b',');
-                let (Some(a), Some(_ws), Some(class)) = (it.next(), it.next(), it.next()) else {
-                    return;
-                };
-                let Some(a) = hex(a) else { return };
-                let idx = RULES
-                    .iter()
-                    .find(|r| r.0.as_bytes() == class)
-                    .map_or(0, |r| r.1);
-                match self.wins.iter_mut().find(|w| w.0 == a) {
-                    Some(w) => w.1 = idx,
-                    None => self.wins.push((a, idx)),
-                }
-            }
-            // окно закрыто: забываем
-            b"closewindow" => {
-                if let Some(a) = hex(data) {
-                    if let Some(i) = self.wins.iter().position(|w| w.0 == a) {
-                        self.wins.swap_remove(i);
-                    }
-                    if self.cur == Some(a) {
-                        self.cur = None;
+                if let Some(id) = self.cur {
+                    if self.classes[id].1 != q {
+                        self.classes[id].1 = q;
+                        self.save();
                     }
                 }
             }
@@ -159,34 +206,46 @@ fn main() -> std::io::Result<()> {
         env::var("XDG_RUNTIME_DIR"),
         env::var("HYPRLAND_INSTANCE_SIGNATURE"),
     ) else {
-        eprintln!("Запускай внутри Hyprland");
+        eprintln!("Run this inside a Hyprland session");
         std::process::exit(1);
     };
     let dir = format!("{rt}/hypr/{sig}");
 
     let mut st = State {
         cmd_path: format!("{dir}/.socket.sock"),
-        wins: Vec::new(),
+        keyboard: env::var("OWL_KEYBOARD").unwrap_or_else(|_| KEYBOARD.to_string()),
+        debug: env::var_os("OWL_DEBUG").is_some(),
+        classes: Vec::new(),
         cur: None,
         curidx: None,
-        pending: 0,
-        mainkb: Vec::new(),
+        store: store_path(),
         buf: Vec::with_capacity(16384),
     };
 
-    // на старте выравниваем все устройства по основной клавиатуре
+    st.load();
     st.curidx = st.query_idx();
-    if let Some(i) = st.curidx {
-        let _ = st.cmd(format!("/switchxkblayout all {i}").as_bytes());
+    match st.curidx {
+        Some(i) => {
+            if st.debug {
+                eprintln!("start: keyboard {:?}, layout {i}, remembered classes: {}",
+                    st.keyboard, st.classes.len());
+            }
+            st.switch_all(i); // sync other "keyboards" to match ours
+        }
+        None => {
+            eprintln!("Keyboard {:?} not found. See `hyprctl devices` for device names", st.keyboard);
+            std::process::exit(1);
+        }
     }
+    st.init_focus();
 
     let mut ev = UnixStream::connect(format!("{dir}/.socket2.sock"))?;
     let mut buf = [0u8; 4096];
     let mut have = 0;
     loop {
-        // блокирующее чтение: пока событий нет, процесс спит и не ест CPU
+        // blocking read: while there are no events, the process sleeps and uses no CPU
         let n = match ev.read(&mut buf[have..]) {
-            Ok(0) => break, // Хайпр закрылся
+            Ok(0) => break, // Hyprland closed
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -200,7 +259,7 @@ fn main() -> std::io::Result<()> {
         buf.copy_within(start..have, 0);
         have -= start;
         if have == buf.len() {
-            have = 0; // строка длиннее буфера, выкидываем
+            have = 0; // line longer than buffer, discard it
         }
     }
     Ok(())
