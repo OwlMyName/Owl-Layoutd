@@ -14,7 +14,12 @@ use std::time::Duration;
 /// Keyboard whose layout we track
 const KEYBOARD: &str = "at-translated-set-2-keyboard";
 
-/// Layout when no window is focused (Rofi, panels): 0 = first in the list (us)
+/// Layer-shell namespaces that take keyboard input (Rofi, launchers).
+/// Names show up in the debug log as "layer open: ...". Each one gets its own
+/// remembered layout, stored under the key "layer:<name>".
+const LAYERS: &[&str] = &["rofi"];
+
+/// Layout when no window is focused: 0 = first in the list (us)
 const NO_WINDOW_LAYOUT: u8 = 0;
 
 struct State {
@@ -23,6 +28,7 @@ struct State {
     debug: bool,
     classes: Vec<(Vec<u8>, u8)>, // window class -> remembered layout
     cur: Option<usize>,          // currently focused class
+    layer: Option<usize>,        // input layer (Rofi...) currently on screen
     curidx: Option<u8>,          // current keyboard layout
     store: Option<PathBuf>,      // file where state is persisted
     buf: Vec<u8>,                // buffer for Hyprland replies
@@ -161,7 +167,9 @@ impl State {
                     if self.debug {
                         eprintln!("focus: no window, data={:?}", String::from_utf8_lossy(data));
                     }
-                    self.apply(NO_WINDOW_LAYOUT);
+                    if self.layer.is_none() {
+                        self.apply(NO_WINDOW_LAYOUT);
+                    }
                 } else {
                     let id = self.class_id(class);
                     self.cur = Some(id);
@@ -170,26 +178,57 @@ impl State {
                         eprintln!("focus: class {:?} wants {idx}, now {:?}",
                             String::from_utf8_lossy(class), self.curidx);
                     }
+                    if self.layer.is_none() {
+                        self.apply(idx); // while a layer is open, it owns the keyboard
+                    }
+                }
+            }
+            // an overlay (Rofi, panels) appeared
+            b"openlayer" => {
+                if self.debug {
+                    eprintln!("layer open: {:?}", String::from_utf8_lossy(data));
+                }
+                if LAYERS.iter().any(|l| l.as_bytes() == data) {
+                    let mut key = b"layer:".to_vec();
+                    key.extend_from_slice(data);
+                    let id = self.class_id(&key);
+                    self.layer = Some(id);
+                    let idx = self.classes[id].1;
                     self.apply(idx);
                 }
             }
-            // layout changed: remember it for the focused class
+            // an overlay disappeared: give the keyboard back to the window below
+            b"closelayer" => {
+                if self.debug {
+                    eprintln!("layer close: {:?}", String::from_utf8_lossy(data));
+                }
+                if self.layer.is_some() && LAYERS.iter().any(|l| l.as_bytes() == data) {
+                    self.layer = None;
+                    let idx = match self.cur {
+                        Some(id) => self.classes[id].1,
+                        None => NO_WINDOW_LAYOUT,
+                    };
+                    self.apply(idx);
+                }
+            }
+            // layout changed: remember it for whoever owns the keyboard right now
             b"activelayout" => {
                 let kb = data.split(|&b| b == b',').next().unwrap_or(&[]);
                 if kb != self.keyboard.as_bytes() {
                     return; // ignore other devices
                 }
                 let Some(q) = self.query_idx() else { return };
+                let owner = self.layer.or(self.cur);
                 if self.debug {
-                    eprintln!("layout event: now {q}, known {:?}, class {:?}", self.curidx,
-                        self.cur.map(|i| String::from_utf8_lossy(&self.classes[i].0).into_owned()));
+                    eprintln!("layout event: now {q}, known {:?}, owner {:?}", self.curidx,
+                        owner.map(|i| String::from_utf8_lossy(&self.classes[i].0).into_owned()));
                 }
                 if self.curidx != Some(q) {
                     // user switched manually: sync the remaining devices
                     self.curidx = Some(q);
                     self.switch_all(q);
                 }
-                if let Some(id) = self.cur {
+                if let Some(id) = owner {
                     if self.classes[id].1 != q {
                         self.classes[id].1 = q;
                         self.save();
@@ -217,6 +256,7 @@ fn main() -> std::io::Result<()> {
         debug: env::var_os("OWL_DEBUG").is_some(),
         classes: Vec::new(),
         cur: None,
+        layer: None,
         curidx: None,
         store: store_path(),
         buf: Vec::with_capacity(16384),
