@@ -5,14 +5,36 @@
 # Featuring:
 
 
-Remembers window layouts in Hyprland. By default, Hyprland applies a single keyboard layout globally across all windows. However, if you use more than one language, this becomes a hassle. While hyprland-per-window-layout exists, in my case it sometimes picked the wrong layout. This tiny daemon should solve the problem completely! With it, managing layouts feels just like in KDE, Windows, or any other sane OS. Uses about 130 KB of private memory (≈2.2 MB RSS including shared libraries). Simple, reliable and efficient.
+By default Hyprland applies one keyboard layout to all windows. If you type in more than one language, that gets annoying fast: English in the terminal, Russian in the messenger, and you keep switching by hand.
+
+Owl-Layoutd remembers the layout **for each application** and restores it when you focus that window, just like KDE's "Application" switching policy. It is a tiny Rust daemon with zero dependencies: about 130 KB of private memory (≈2.2 MB RSS including shared libraries), and it sleeps when nothing happens.
+
+I wrote it because `hyprland-per-window-layout` sometimes picked the wrong layout on my setup (four layouts and a lot of extra virtual "keyboards").
 
 ## How it works
 
-- Listens to Hyprland events over its socket, sleeps when idle.
-- Remembers the layout of each window and restores it on focus.
-- Ignores fake "keyboards" (power button, headphones, ydotool).
-- Each new window can start with its own layout, based on its class.
+- Listens to Hyprland events over its socket and sleeps when idle.
+- Remembers the layout **per application** (window class), like KDE's "Application" switching policy. Every program keeps its own layout, even if you have several windows of it.
+- Saves its memory to `~/.local/state/owl-layoutd/classes`, so layouts survive reboots.
+- Treats overlays like Rofi as their own "application" (starts in the first layout until you change it).
+- Tracks one real keyboard by name and ignores fake "keyboards" (power button, headphones, ydotool). Keeps all devices in sync.
+
+
+## Configuration
+
+- **Keyboard**: the daemon tracks `at-translated-set-2-keyboard` by default. Find yours
+  with `hyprctl devices` and set it via `OWL_KEYBOARD=<name>` or the `KEYBOARD` constant in `src/main.rs`.
+- **Overlays** (Rofi, launchers): add their layer-shell names to the `LAYERS` list in `src/main.rs`.
+  Names are printed as `layer open: ...` in the debug log.
+- **Reset memory**: delete `~/.local/state/owl-layoutd/classes`.
+- **Debug**: run with `OWL_DEBUG=1 Owl-Layoutd` to print every decision. To keep the logs in the systemd journal:
+
+```
+exec-once = OWL_DEBUG=1 systemd-cat -t owl-layoutd Owl-Layoutd
+```
+
+Read them with `journalctl -t owl-layoutd -e`.
+
 
 ## Install
 
@@ -31,12 +53,8 @@ Add to `hyprland.conf`:
 exec-once = Owl-Layoutd
 ```
 
-## Configuration
+Make sure `~/.local/bin` is in your `PATH`, or use the full path in `exec-once`.
 
-Start layouts for new windows are set in the `RULES` table
-at the top of `src/main.rs` (0 = first layout, 1 = second, ...).
-Find a window class with `hyprctl clients | grep class`.
-Rebuild after editing.
 
 ## Tested on
 

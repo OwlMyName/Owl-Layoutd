@@ -1,7 +1,11 @@
 [package]
 name = "Owl-Layoutd"
-version = "0.1.0"
+description = "Per-application keyboard layout memory for Hyprland, like in KDE. Tiny Rust daemon, zero dependencies."
+version = "0.2.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/OwlMyName/Owl-Layoutd"
+
 
 [profile.release]
 opt-level = "s"
